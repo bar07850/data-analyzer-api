@@ -1,20 +1,10 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-
 from sklearn.linear_model import LogisticRegression, LinearRegression, Ridge
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    RandomForestRegressor,
-    GradientBoostingClassifier,
-    GradientBoostingRegressor,
-)
-
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -25,24 +15,26 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
 )
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    KFold,
+    cross_validate,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
-def detect_problem_type(y: pd.Series) -> str:
-    """
-    Determine whether the target is more likely
-    classification or regression.
-    """
+# ============================================================
+# PROBLEM TYPE DETECTION
+# ============================================================
 
-    y_clean = y.dropna()
+def detect_problem_type(y):
+    unique_count = y.nunique(dropna=True)
+    unique_ratio = unique_count / max(len(y), 1)
 
-    if y_clean.empty:
-        raise ValueError("Target column contains no usable values.")
-
-    if not pd.api.types.is_numeric_dtype(y_clean):
+    if not pd.api.types.is_numeric_dtype(y):
         return "classification"
-
-    unique_count = y_clean.nunique()
-    unique_ratio = unique_count / len(y_clean)
 
     if unique_count <= 20 or unique_ratio <= 0.05:
         return "classification"
@@ -50,421 +42,320 @@ def detect_problem_type(y: pd.Series) -> str:
     return "regression"
 
 
-def build_preprocessor(X: pd.DataFrame):
+# ============================================================
+# FEATURE CLEANUP
+# ============================================================
 
-    numeric_features = X.select_dtypes(
-        include=["number"]
-    ).columns.tolist()
+def remove_problematic_features(X):
+    """
+    Removes columns that are very likely to be identifiers or
+    extremely high-cardinality text fields.
 
-    categorical_features = X.select_dtypes(
-        exclude=["number"]
-    ).columns.tolist()
+    These columns can create enormous one-hot encoded matrices.
+    """
 
+    drop_columns = []
+
+    for column in X.columns:
+        series = X[column]
+        unique_count = series.nunique(dropna=True)
+        unique_ratio = unique_count / max(len(series), 1)
+
+        # Very likely ID / row identifier
+        if unique_ratio >= 0.95:
+            drop_columns.append(column)
+            continue
+
+        # Very high-cardinality categorical feature
+        if (
+            not pd.api.types.is_numeric_dtype(series)
+            and unique_count > 100
+            and unique_ratio > 0.50
+        ):
+            drop_columns.append(column)
+
+    cleaned = X.drop(columns=drop_columns, errors="ignore")
+
+    return cleaned, drop_columns
+
+
+# ============================================================
+# PREPROCESSOR
+# ============================================================
+
+def build_preprocessor(X):
+    numeric_columns = X.select_dtypes(include=[np.number]).columns.tolist()
+
+    categorical_columns = [
+        column
+        for column in X.columns
+        if column not in numeric_columns
+    ]
 
     numeric_pipeline = Pipeline(
         steps=[
-            (
-                "imputer",
-                SimpleImputer(strategy="median")
-            ),
-            (
-                "scaler",
-                StandardScaler()
-            ),
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
         ]
     )
-
 
     categorical_pipeline = Pipeline(
         steps=[
-            (
-                "imputer",
-                SimpleImputer(
-                    strategy="most_frequent"
-                )
-            ),
+            ("imputer", SimpleImputer(strategy="most_frequent")),
             (
                 "encoder",
                 OneHotEncoder(
-                    handle_unknown="ignore"
-                )
+                    handle_unknown="ignore",
+                    sparse_output=True,
+                ),
             ),
         ]
     )
 
-
-    preprocessor = ColumnTransformer(
+    return ColumnTransformer(
         transformers=[
-            (
-                "numeric",
-                numeric_pipeline,
-                numeric_features
-            ),
-            (
-                "categorical",
-                categorical_pipeline,
-                categorical_features
-            ),
+            ("numeric", numeric_pipeline, numeric_columns),
+            ("categorical", categorical_pipeline, categorical_columns),
         ]
     )
 
-    return preprocessor
 
+# ============================================================
+# CLASSIFICATION
+# ============================================================
 
-def train_classification_models(
-    X: pd.DataFrame,
-    y: pd.Series
-):
+def train_classification_models(X, y):
+    class_counts = y.value_counts()
 
-    preprocessor = build_preprocessor(X)
+    if len(class_counts) < 2:
+        raise ValueError(
+            "Classification requires at least two target classes."
+        )
+
+    minimum_class_count = int(class_counts.min())
+
+    if minimum_class_count < 2:
+        raise ValueError(
+            "At least two examples are required for every target class."
+        )
+
+    folds = min(5, minimum_class_count)
+
+    cv = StratifiedKFold(
+        n_splits=folds,
+        shuffle=True,
+        random_state=42,
+    )
 
     models = {
-        "Logistic Regression":
-            LogisticRegression(
-                max_iter=2000
-            ),
-
-        "Random Forest":
-            RandomForestClassifier(
-                n_estimators=200,
-                random_state=42
-            ),
-
-        "Gradient Boosting":
-            GradientBoostingClassifier(
-                random_state=42
-            ),
-    }
-
-
-    X_train, X_test, y_train, y_test = (
-        train_test_split(
-            X,
-            y,
-            test_size=0.2,
+        "Logistic Regression": LogisticRegression(
+            max_iter=3000,
             random_state=42,
-            stratify=y
-        )
-    )
-
-
-    results = []
-
-
-    for name, model in models.items():
-
-        pipeline = Pipeline(
-            steps=[
-                (
-                    "preprocessor",
-                    preprocessor
-                ),
-                (
-                    "model",
-                    model
-                ),
-            ]
-        )
-
-
-        pipeline.fit(
-            X_train,
-            y_train
-        )
-
-
-        predictions = pipeline.predict(
-            X_test
-        )
-
-
-        accuracy = accuracy_score(
-            y_test,
-            predictions
-        )
-
-
-        precision = precision_score(
-            y_test,
-            predictions,
-            average="weighted",
-            zero_division=0
-        )
-
-
-        recall = recall_score(
-            y_test,
-            predictions,
-            average="weighted",
-            zero_division=0
-        )
-
-
-        f1 = f1_score(
-            y_test,
-            predictions,
-            average="weighted",
-            zero_division=0
-        )
-
-
-        result = {
-            "model": name,
-            "accuracy": round(
-                float(accuracy),
-                4
-            ),
-            "precision": round(
-                float(precision),
-                4
-            ),
-            "recall": round(
-                float(recall),
-                4
-            ),
-            "f1": round(
-                float(f1),
-                4
-            ),
-        }
-
-
-        if y.nunique() == 2:
-
-            try:
-
-                probabilities = (
-                    pipeline.predict_proba(
-                        X_test
-                    )[:, 1]
-                )
-
-                auc = roc_auc_score(
-                    y_test,
-                    probabilities
-                )
-
-                result["roc_auc"] = round(
-                    float(auc),
-                    4
-                )
-
-            except Exception:
-
-                result["roc_auc"] = None
-
-
-        results.append(
-            result
-        )
-
-
-    results.sort(
-        key=lambda x: x["f1"],
-        reverse=True
-    )
-
-
-    return results
-
-
-def train_regression_models(
-    X: pd.DataFrame,
-    y: pd.Series
-):
-
-    preprocessor = build_preprocessor(X)
-
-
-    models = {
-
-        "Linear Regression":
-            LinearRegression(),
-
-        "Ridge Regression":
-            Ridge(),
-
-        "Random Forest":
-            RandomForestRegressor(
-                n_estimators=200,
-                random_state=42
-            ),
-
-        "Gradient Boosting":
-            GradientBoostingRegressor(
-                random_state=42
-            ),
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=200,
+            random_state=42,
+            n_jobs=-1,
+        ),
     }
 
+    scoring = {
+        "accuracy": "accuracy",
+        "precision": "precision_weighted",
+        "recall": "recall_weighted",
+        "f1": "f1_weighted",
+    }
 
-    X_train, X_test, y_train, y_test = (
-        train_test_split(
-            X,
-            y,
-            test_size=0.2,
-            random_state=42
-        )
-    )
+    binary_problem = y.nunique() == 2
 
+    if binary_problem:
+        scoring["roc_auc"] = "roc_auc"
+    else:
+        scoring["roc_auc"] = "roc_auc_ovr_weighted"
 
     results = []
 
-
-    for name, model in models.items():
-
+    for model_name, model in models.items():
         pipeline = Pipeline(
             steps=[
-                (
-                    "preprocessor",
-                    preprocessor
-                ),
-                (
-                    "model",
-                    model
-                ),
+                ("preprocessor", build_preprocessor(X)),
+                ("model", model),
             ]
         )
 
-
-        pipeline.fit(
-            X_train,
-            y_train
+        scores = cross_validate(
+            pipeline,
+            X,
+            y,
+            cv=cv,
+            scoring=scoring,
+            n_jobs=1,
+            error_score="raise",
         )
-
-
-        predictions = pipeline.predict(
-            X_test
-        )
-
-
-        mae = mean_absolute_error(
-            y_test,
-            predictions
-        )
-
-
-        rmse = np.sqrt(
-            mean_squared_error(
-                y_test,
-                predictions
-            )
-        )
-
-
-        r2 = r2_score(
-            y_test,
-            predictions
-        )
-
 
         results.append(
             {
-                "model": name,
-                "mae": round(
-                    float(mae),
-                    4
+                "model": model_name,
+                "accuracy": round(
+                    float(np.mean(scores["test_accuracy"])), 4
                 ),
-                "rmse": round(
-                    float(rmse),
-                    4
+                "accuracy_std": round(
+                    float(np.std(scores["test_accuracy"])), 4
                 ),
-                "r2": round(
-                    float(r2),
-                    4
+                "precision": round(
+                    float(np.mean(scores["test_precision"])), 4
                 ),
+                "recall": round(
+                    float(np.mean(scores["test_recall"])), 4
+                ),
+                "f1": round(
+                    float(np.mean(scores["test_f1"])), 4
+                ),
+                "f1_std": round(
+                    float(np.std(scores["test_f1"])), 4
+                ),
+                "roc_auc": round(
+                    float(np.mean(scores["test_roc_auc"])), 4
+                ),
+                "cv_folds": folds,
             }
         )
 
-
     results.sort(
-        key=lambda x: x["r2"],
-        reverse=True
+        key=lambda item: item["f1"],
+        reverse=True,
     )
-
 
     return results
 
 
-def run_modeling(
-    dataframe: pd.DataFrame,
-    target: str
-):
+# ============================================================
+# REGRESSION
+# ============================================================
 
-    if target not in dataframe.columns:
+def train_regression_models(X, y):
+    folds = min(5, len(y))
+
+    if folds < 2:
         raise ValueError(
-            f"Target column '{target}' was not found."
+            "Not enough rows are available for cross-validation."
         )
 
-
-    df = dataframe.copy()
-
-
-    df = df.dropna(
-        subset=[target]
+    cv = KFold(
+        n_splits=folds,
+        shuffle=True,
+        random_state=42,
     )
 
+    models = {
+        "Linear Regression": LinearRegression(),
+        "Ridge Regression": Ridge(),
+        "Random Forest Regressor": RandomForestRegressor(
+            n_estimators=200,
+            random_state=42,
+            n_jobs=-1,
+        ),
+    }
 
-    if len(df) < 20:
-        raise ValueError(
-            "Dataset needs at least 20 usable rows for modeling."
+    scoring = {
+        "r2": "r2",
+        "mae": "neg_mean_absolute_error",
+        "rmse": "neg_root_mean_squared_error",
+    }
+
+    results = []
+
+    for model_name, model in models.items():
+        pipeline = Pipeline(
+            steps=[
+                ("preprocessor", build_preprocessor(X)),
+                ("model", model),
+            ]
         )
 
+        scores = cross_validate(
+            pipeline,
+            X,
+            y,
+            cv=cv,
+            scoring=scoring,
+            n_jobs=1,
+            error_score="raise",
+        )
 
-    y = df[target]
+        results.append(
+            {
+                "model": model_name,
+                "r2": round(
+                    float(np.mean(scores["test_r2"])), 4
+                ),
+                "r2_std": round(
+                    float(np.std(scores["test_r2"])), 4
+                ),
+                "mae": round(
+                    float(-np.mean(scores["test_mae"])), 4
+                ),
+                "rmse": round(
+                    float(-np.mean(scores["test_rmse"])), 4
+                ),
+                "cv_folds": folds,
+            }
+        )
 
-    X = df.drop(
+    results.sort(
+        key=lambda item: item["r2"],
+        reverse=True,
+    )
+
+    return results
+
+
+# ============================================================
+# MAIN MODELING FUNCTION
+# ============================================================
+
+def run_modeling(dataframe, target):
+    if target not in dataframe.columns:
+        raise ValueError(
+            f"Target column '{target}' was not found in the dataset."
+        )
+
+    working_data = dataframe.dropna(subset=[target]).copy()
+
+    if len(working_data) < 20:
+        raise ValueError(
+            "At least 20 rows with a non-missing target are required."
+        )
+
+    y = working_data[target]
+
+    X = working_data.drop(
         columns=[target]
     )
 
+    X, dropped_features = remove_problematic_features(X)
 
     if X.shape[1] == 0:
         raise ValueError(
-            "No predictor columns remain after selecting the target."
+            "No usable predictor columns remain after preprocessing."
         )
 
-
-    problem_type = detect_problem_type(
-        y
-    )
-
+    problem_type = detect_problem_type(y)
 
     if problem_type == "classification":
-
-        model_results = (
-            train_classification_models(
-                X,
-                y
-            )
-        )
-
+        models = train_classification_models(X, y)
+        selection_metric = "F1 score"
     else:
-
-        model_results = (
-            train_regression_models(
-                X,
-                y
-            )
-        )
-
+        models = train_regression_models(X, y)
+        selection_metric = "R²"
 
     return {
-        "problem_type":
-            problem_type,
-
-        "target":
-            target,
-
-        "rows_used":
-            len(df),
-
-        "features_used":
-            X.shape[1],
-
-        "best_model":
-            model_results[0][
-                "model"
-            ],
-
-        "models":
-            model_results,
+        "problem_type": problem_type,
+        "target": target,
+        "rows_used": int(len(working_data)),
+        "features_used": int(X.shape[1]),
+        "dropped_features": dropped_features,
+        "selection_metric": selection_metric,
+        "best_model": models[0]["model"],
+        "models": models,
     }
